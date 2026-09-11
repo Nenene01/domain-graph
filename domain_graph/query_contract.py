@@ -17,6 +17,10 @@ class Principal:
     project_ids: frozenset[str]
     scopes: frozenset[str]
     token_expires_at: datetime
+    # Optional for existing trusted query API callers. MCP production callers
+    # must provide both values and are checked by its deployment policy.
+    tenant_id: str | None = None
+    token_id: str | None = None
 
 @dataclass(frozen=True)
 class TraceRequest:
