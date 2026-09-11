@@ -25,7 +25,13 @@ class InputValidationError(ValueError):
     """A safe machine-readable error; input values are never included."""
     def __init__(self, message: str, *, code: str = "invalid_field", path: str | Path | None = None,
                  field: str | None = None, record_id: str | None = None):
-        self.code, self.path, self.field, self.record_id = code, str(path) if path else None, field, record_id
+        # Never expose a workspace absolute path in an exception or its JSON form.
+        safe_path = None
+        if path:
+            candidate = Path(path)
+            parts = candidate.parts
+            safe_path = str(Path("inputs", *parts[parts.index("inputs") + 1:])) if "inputs" in parts else candidate.name
+        self.code, self.path, self.field, self.record_id = code, safe_path, field, record_id
         super().__init__(f"{self.path}: {message}" if self.path else message)
 
     def as_dict(self) -> dict[str, str]:
@@ -80,10 +86,14 @@ def _valid_datetime(value: Any, path: Path, field: str, record_id: str | None = 
 
 
 def _provenance(source: str, path: Path, value: dict[str, Any], relation: dict[str, Any] | None = None, index: int | None = None) -> dict[str, Any]:
-    p = (relation or {}).get("provenance") or value.get("provenance") or {}; rid = value["id"]
+    # A relation without its own provenance inherits values, but gets a distinct
+    # relation anchor and evidence; it must not silently reuse the node anchor.
+    own = (relation or {}).get("provenance")
+    p = own or value.get("provenance") or {}; rid = value["id"]
     retrieved = p.get("retrieved_at", "1970-01-01T00:00:00Z")
+    default_anchor = f"$.relations[{index}]" if relation is not None else "$"
     return {"source_type": p.get("source_type", source), "source_path": str(path), "source_id": p.get("source_id", rid),
-            "source_locator": p.get("source_locator", f"inputs/{source}/{path.name}"), "source_anchor": p.get("source_anchor", f"$.relations[{index}]" if relation is not None else "$"),
+            "source_locator": p.get("source_locator", f"inputs/{source}/{path.name}"), "source_anchor": p.get("source_anchor", default_anchor) if own else default_anchor,
             "source_revision": p.get("source_revision"), "retrieved_at": retrieved, "updated_by": p.get("updated_by", "unknown"),
             "observed_at": p.get("observed_at", retrieved), "extraction_method": p.get("extraction_method", value.get("extractionMethod", "deterministic_import")),
             "confidence": p.get("confidence", value.get("confidence", 1.0)), "evidence_excerpt": p.get("evidence_excerpt", (relation or {}).get("evidenceExcerpt", value.get("evidenceExcerpt", value["title"]))) }
@@ -105,11 +115,15 @@ def _validate(value: Any, source: str, path: Path) -> dict[str, Any]:
         if missing: raise _error("invalid_field", path, missing, "required field is missing", rid)
     if not isinstance(value.get("relations", []), list): raise _error("invalid_relation", path, "relations", "relations must be an array", rid)
     if value.get("type") is not None and value["type"] not in NODE_TYPES: raise _error("invalid_field", path, "type", "unsupported node type", rid)
-    value["type"] = value.get("type") or DEFAULT_TYPES[source]; p = _provenance(source, path, value); value["provenance"] = p
+    value["type"] = value.get("type") or DEFAULT_TYPES[source]
+    original_provenance = value.get("provenance")
+    if strict and not isinstance(original_provenance, dict):
+        raise _error("invalid_field", path, "provenance", "required provenance object", rid)
     if strict:
         required_provenance = ("source_id", "source_type", "source_locator", "source_anchor", "retrieved_at", "updated_by", "observed_at", "extraction_method", "confidence", "evidence_excerpt")
-        missing = next((field for field in required_provenance if field not in (value.get("provenance") or {})), None)
+        missing = next((field for field in required_provenance if field not in original_provenance), None)
         if missing: raise _error("invalid_field", path, f"provenance.{missing}", "required provenance field", rid)
+    p = _provenance(source, path, value); value["provenance"] = p
     has_status, has_legacy = "approvalStatus" in value, "approved" in value; status = value.get("approvalStatus", "approved" if value.get("approved") is True else "proposed")
     if has_status and has_legacy and ((value["approved"] is True) != (status == "approved")): raise _error("invalid_approval_state", path, "approvalStatus", "approval fields conflict", rid)
     value["approvalStatus"] = status; value["approved"] = status == "approved"; value["extractionMethod"] = value.get("extractionMethod", p["extraction_method"]); value["confidence"] = value.get("confidence", p["confidence"]); value["evidenceExcerpt"] = value.get("evidenceExcerpt", p["evidence_excerpt"])
@@ -126,12 +140,33 @@ def _validate(value: Any, source: str, path: Path) -> dict[str, Any]:
     if Path(p["source_locator"]).is_absolute() or (locator_url.query and re.search(r"(?i)(token|password|secret|key|auth)=", locator_url.query)) or (locator_url.fragment and re.search(r"(?i)(token|password|secret|key|auth)", locator_url.fragment)):
         raise _error("sensitive_content", path, "provenance.source_locator", "source locator must be safe and relative", rid)
     for field in ("retrieved_at", "observed_at"): _valid_datetime(p[field], path, f"provenance.{field}", rid)
+    _safe_excerpt(p["evidence_excerpt"], path, "provenance.evidence_excerpt", rid)
+    if p.get("extraction_method") != value["extractionMethod"]:
+        raise _error("invalid_field", path, "provenance.extraction_method", "provenance does not match record", rid)
+    try:
+        if float(p.get("confidence")) != float(value["confidence"]):
+            raise _error("invalid_field", path, "provenance.confidence", "provenance does not match record", rid)
+    except (TypeError, ValueError) as exc:
+        raise _error("invalid_field", path, "provenance.confidence", "confidence must be numeric", rid) from exc
+    if p.get("evidence_excerpt") != value["evidenceExcerpt"]:
+        raise _error("invalid_field", path, "provenance.evidence_excerpt", "provenance does not match record", rid)
     for index, relation in enumerate(value["relations"]):
         if not isinstance(relation, dict) or relation.get("type") not in ALLOWED_RELATIONS or not isinstance(relation.get("to"), str) or not relation["to"]: raise _error("invalid_relation", path, f"relations[{index}]", "unsupported relation or empty target", rid)
+        if strict and ("evidenceExcerpt" not in relation and not (isinstance(relation.get("provenance"), dict) and "evidence_excerpt" in relation["provenance"])):
+            raise _error("invalid_field", path, f"relations[{index}].evidenceExcerpt", "relation evidence excerpt is required", rid)
         rp = _provenance(source, path, value, relation, index); _safe_excerpt(relation.get("evidenceExcerpt", rp["evidence_excerpt"]), path, f"relations[{index}].evidenceExcerpt", rid)
+        if "evidenceExcerpt" in relation:
+            rp["evidence_excerpt"] = relation["evidenceExcerpt"]
         for field in ("source_id", "source_type", "source_locator", "source_anchor", "updated_by"):
             if not isinstance(rp.get(field), str) or not rp[field].strip(): raise _error("invalid_field", path, f"relations[{index}].provenance.{field}", "required provenance field", rid)
         for field in ("retrieved_at", "observed_at"): _valid_datetime(rp[field], path, f"relations[{index}].provenance.{field}", rid)
+        relation_status = relation.get("approvalStatus", value["approvalStatus"])
+        relation_method = relation.get("extractionMethod", value["extractionMethod"])
+        if relation_status not in APPROVAL_STATUSES or relation_method not in EXTRACTION_METHODS:
+            raise _error("invalid_approval_state" if relation_status not in APPROVAL_STATUSES else "invalid_field", path, f"relations[{index}]", "invalid relation assertion", rid)
+        if relation_method == "ai_inferred" and relation_status != "proposed":
+            raise _error("invalid_approval_state", path, f"relations[{index}].approvalStatus", "AI inference must be proposed", rid)
+        relation["approvalStatus"] = relation_status; relation["extractionMethod"] = relation_method
         relation["provenance"] = rp; relation["evidenceExcerpt"] = relation.get("evidenceExcerpt", rp["evidence_excerpt"])
     return value
 
@@ -172,10 +207,21 @@ class InMemoryGraph:
     def ingest(self, records: Iterable[dict[str, Any]]) -> None:
         nodes, edges = normalize_inputs(records); old_nodes, old_edges = self.nodes.copy(), self.edges.copy()
         try:
-            for node in nodes: self.nodes[node["id"]] = node
+            for node in nodes:
+                existing = self.nodes.get(node["id"])
+                if existing and existing != node:
+                    # Never let an unapproved/AI assertion replace a human-approved definition.
+                    if existing.get("approvalStatus") == "approved" and existing.get("extractionMethod") != "ai_inferred":
+                        raise InputValidationError("conflicting record", code="conflicting_record", record_id=node["id"])
+                    self.nodes[node["id"]] = node
+                else:
+                    self.nodes[node["id"]] = node
             for edge in edges:
                 if edge["to"] not in self.nodes: raise InputValidationError(f"unregistered target: {edge['to']}", code="unknown_target")
-                self.edges[(edge["from"], edge["type"], edge["to"])] = edge
+                key = (edge["from"], edge["type"], edge["to"]); existing = self.edges.get(key)
+                if existing and existing != edge and existing.get("approvalStatus") == "approved" and existing.get("extractionMethod") != "ai_inferred":
+                    raise InputValidationError("conflicting relation", code="conflicting_record", record_id=edge["from"])
+                self.edges[key] = edge
         except Exception: self.nodes, self.edges = old_nodes, old_edges; raise
     def trace(self, start: str, target: str | None = None) -> dict[str, Any]:
         if start not in self.nodes: return {"status": "not_registered", "nodes": [], "relations": []}
@@ -194,8 +240,8 @@ def neo4j_statements(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -
     statements = [(query, {}) for query in CONSTRAINTS]
     for node in nodes:
         params = dict(node); params.update(node["provenance"])
-        statements.append(("MERGE (n:DomainNode {id: $id}) ON CREATE SET n.createdAt=$createdAt SET n.type=$type, n.title=$title, n.approved=$approved, n.approvalStatus=$approvalStatus, n.extractionMethod=$extractionMethod, n.confidence=$confidence, n.evidenceExcerpt=$evidenceExcerpt, n.sourceId=$source_id, n.sourceType=$source_type, n.sourceLocator=$source_locator, n.sourceAnchor=$source_anchor, n.sourceRevision=$source_revision, n.retrievedAt=$retrieved_at, n.updatedBy=$updated_by, n.observedAt=$observed_at, n.updatedAt=$updatedAt", {**params, "createdAt": node["provenance"].get("retrieved_at"), "updatedAt": node["provenance"].get("retrieved_at")}))
+        statements.append(("MERGE (n:DomainNode {id: $id}) ON CREATE SET n.createdAt=$createdAt SET n.type=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.type ELSE $type END, n.title=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.title ELSE $title END, n.approved=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.approved ELSE $approved END, n.approvalStatus=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.approvalStatus ELSE $approvalStatus END, n.extractionMethod=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.extractionMethod ELSE $extractionMethod END, n.confidence=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.confidence ELSE $confidence END, n.evidenceExcerpt=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.evidenceExcerpt ELSE $evidenceExcerpt END, n.sourceId=$source_id, n.sourceType=$source_type, n.sourceLocator=$source_locator, n.sourceAnchor=$source_anchor, n.sourceRevision=$source_revision, n.retrievedAt=$retrieved_at, n.updatedBy=$updated_by, n.observedAt=$observed_at", {**params, "createdAt": node["provenance"].get("retrieved_at")}))
     for edge in edges:
         payload = dict(edge); payload["key"] = f"{edge['from']}|{edge['type']}|{edge['to']}"; payload.update(edge["provenance"])
-        statements.append(("MATCH (a:DomainNode {id:$from}), (b:DomainNode {id:$to}) MERGE (a)-[r:RELATION {key:$key}]->(b) SET r.type=$type, r.approvalStatus=$approvalStatus, r.extractionMethod=$extractionMethod, r.confidence=$confidence, r.evidenceExcerpt=$evidenceExcerpt, r.sourceId=$source_id, r.sourceType=$source_type, r.sourceLocator=$source_locator, r.sourceAnchor=$source_anchor, r.sourceRevision=$source_revision, r.retrievedAt=$retrieved_at, r.updatedBy=$updated_by, r.observedAt=$observed_at, r.updatedAt=$updatedAt", {**payload, "updatedAt": edge["provenance"].get("retrieved_at")}))
+        statements.append(("MATCH (a:DomainNode {id:$from}), (b:DomainNode {id:$to}) MERGE (a)-[r:RELATION {key:$key}]->(b) SET r.type=$type, r.approvalStatus=$approvalStatus, r.extractionMethod=$extractionMethod, r.confidence=$confidence, r.evidenceExcerpt=$evidenceExcerpt, r.sourceId=$source_id, r.sourceType=$source_type, r.sourceLocator=$source_locator, r.sourceAnchor=$source_anchor, r.sourceRevision=$source_revision, r.retrievedAt=$retrieved_at, r.updatedBy=$updated_by, r.observedAt=$observed_at", payload))
     return statements
