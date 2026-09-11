@@ -1,0 +1,12 @@
+[project]
+name = "domain-graph"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+neo4j = ["neo4j>=5.0"]
+test = ["pytest>=7.0"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

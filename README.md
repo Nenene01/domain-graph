@@ -95,3 +95,18 @@ inputs/
 - 機密情報を含むデータの無制限な外部 API 送信
 
 この README はプロダクトのコンセプトと初期方針を記録するものです。実装仕様、グラフスキーマ、入力フォーマット、認証方式は今後の設計記録として追加します。
+
+## MVP のローカル実行
+
+`inputs/meeting-notes`、`inputs/requirements`、`inputs/design`、`inputs/source-metadata` に、`id`、`title`、`relations`、`provenance` を持つ JSON を配置します。`domain_graph.ingest.load_inputs()` が検証・正規化し、`Neo4jStore` は全処理を1トランザクションで実行します。ノードと関係は `MERGE`、`id` と関係キーはユニーク制約で冪等に取り込まれます。
+
+```python
+from domain_graph.ingest import load_inputs
+from domain_graph.neo4j_store import Neo4jStore
+from neo4j import GraphDatabase
+
+driver = GraphDatabase.driver("bolt://localhost:7687", auth=("neo4j", "<secret-from-environment>"))
+Neo4jStore(driver).ingest(load_inputs("inputs"))
+```
+
+サンプル入力では `REQ-ORDER-001` から `DEC-ORDER-001`、`MTG-2026-001`、`DSN-ORDER-001`、`CODE-ORDER-001` を provenance 付きで辿れます。問い合わせ対象が未登録の場合は `not_registered`、登録済みでも指定先への根拠がない場合は `evidence_insufficient` を返します。`python3 -m unittest discover -v` で主要な受け入れ条件を検証できます。

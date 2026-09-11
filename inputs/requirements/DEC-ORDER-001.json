@@ -1,0 +1,8 @@
+{
+  "id": "DEC-ORDER-001",
+  "title": "注文登録は確定時に在庫を引き当てる",
+  "type": "Decision",
+  "approved": true,
+  "relations": [{"type": "DERIVED_FROM", "to": "MTG-2026-001"}],
+  "provenance": {"source_id": "DEC-ORDER-001", "updated_by": "product-owner", "retrieved_at": "2026-01-15T00:00:00Z"}
+}

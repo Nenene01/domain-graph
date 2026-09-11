@@ -1,0 +1,8 @@
+{
+  "id": "DSN-ORDER-001",
+  "title": "注文登録サービス設計",
+  "type": "Design",
+  "approved": true,
+  "relations": [{"type": "IMPLEMENTS", "to": "REQ-ORDER-001"}, {"type": "DECIDED_IN", "to": "DEC-ORDER-001"}],
+  "provenance": {"source_id": "DSN-ORDER-001", "updated_by": "architect", "retrieved_at": "2026-01-16T00:00:00Z"}
+}

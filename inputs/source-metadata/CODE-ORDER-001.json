@@ -1,0 +1,8 @@
+{
+  "id": "CODE-ORDER-001",
+  "title": "OrderRegistrationService",
+  "type": "Code",
+  "approved": true,
+  "relations": [{"type": "IMPLEMENTS", "to": "DSN-ORDER-001"}],
+  "provenance": {"source_id": "CODE-ORDER-001", "updated_by": "developer", "retrieved_at": "2026-01-17T00:00:00Z"}
+}
