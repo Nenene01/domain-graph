@@ -35,3 +35,17 @@ jobs:
       - run: npm run test:neo4j
       - if: always()
         run: docker compose down -v
+
+  python-and-safety:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Python contract tests
+        run: python3 -m unittest discover -v
+      - name: Secret scan hook
+        run: rg -n --hidden --glob '!node_modules/**' --glob '!.git/**' '(BEGIN (RSA|EC|OPENSSH) PRIVATE KEY|password\s*[:=]\s*[^<])' . && exit 1 || true
+      - name: IaC skeleton validation hook
+        run: python3 deploy/validate_manifest.py deploy/manifest.example.yaml || test $? -eq 1

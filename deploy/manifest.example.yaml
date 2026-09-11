@@ -1,0 +1,13 @@
+# Reference-only example. Values are deliberately undecided and must not be applied.
+environment: "<approved-environment>"
+cloud: "<approved-provider>"
+region: "<approved-region>"
+network_cidr: "<approved-cidr>"
+idp_issuer: "<approved-idp-reference>"
+idp_audience: "<approved-audience-reference>"
+kms_key_ref: "<approved-kms-reference>"
+secret_store_ref: "<approved-secret-store-reference>"
+audit_sink_ref: "<approved-audit-sink-reference>"
+backup_catalog_ref: "<approved-backup-catalog-reference>"
+retention_policy_ref: "<approved-retention-policy-reference>"
+artifact_digest: "<sha256-artifact-digest>"
