@@ -375,9 +375,15 @@ def normalize_inputs(records: Iterable[dict[str, Any]]) -> tuple[list[dict[str, 
     for record in records:
         rid = record["id"]; status = record.get("approvalStatus", "approved" if record.get("approved", False) else "proposed"); method = record.get("extractionMethod", "deterministic_import"); confidence = float(record.get("confidence", 1.0)); evidence = record.get("evidenceExcerpt", record["title"])
         node = {"id": rid, "type": record["type"], "title": record["title"], "approved": status == "approved", "approvalStatus": status, "extractionMethod": method, "confidence": confidence, "evidenceExcerpt": evidence, "provenance": record.get("provenance") or {}}
-        if record.get("type") == "Issue":
-            node["issueStatus"] = record.get("issueStatus")
-            node["dueDate"] = record.get("dueDate")
+        # Explicit allowlist: GitHub records may not smuggle arbitrary API maps
+        # (body, actor, headers, tokens, etc.) into the graph.
+        allowed = ("issueStatus", "dueDate", "githubNumber", "githubDatabaseId", "githubSha",
+                   "githubState", "githubCreatedAt", "githubUpdatedAt", "githubClosedAt",
+                   "githubMergedAt", "githubSubmittedAt", "githubCommittedAt", "githubUrl",
+                   "headSha", "mergeCommitSha", "reviewState", "commitSha")
+        for field in allowed:
+            if field in record:
+                node[field] = record[field]
         if rid in nodes and nodes[rid] != node: raise InputValidationError("conflicting record", code="conflicting_record", record_id=rid)
         nodes[rid] = node
         for relation in record.get("relations", []):
@@ -396,18 +402,16 @@ class InMemoryGraph:
             for node in nodes:
                 existing = self.nodes.get(node["id"])
                 if existing and existing != node:
-                    # Never let an unapproved/AI assertion replace a human-approved definition.
-                    # Issue exports additionally reject every cross-export difference;
-                    # there is no assertion store in the Phase 1 relation model.
-                    if node.get("type") == "Issue" or existing.get("approvalStatus") == "approved" and existing.get("extractionMethod") != "ai_inferred":
-                        raise InputValidationError("conflicting record", code="conflicting_record", record_id=node["id"])
+                    # Phase 1 has one record per node. Never silently overwrite
+                    # approved definitions or change an observed GitHub record.
+                    raise InputValidationError("conflicting record", code="conflicting_record", record_id=node["id"])
                     self.nodes[node["id"]] = node
                 else:
                     self.nodes[node["id"]] = node
             for edge in edges:
                 if edge["to"] not in self.nodes: raise InputValidationError(f"unregistered target: {edge['to']}", code="unknown_target")
                 key = (edge["from"], edge["type"], edge["to"]); existing = self.edges.get(key)
-                if existing and existing != edge and (edge.get("from") in self.nodes and self.nodes[edge["from"]].get("type") == "Issue" or existing.get("approvalStatus") == "approved" and existing.get("extractionMethod") != "ai_inferred"):
+                if existing and existing != edge:
                     raise InputValidationError("conflicting relation", code="conflicting_record", record_id=edge["from"])
                 self.edges[key] = edge
         except Exception: self.nodes, self.edges = old_nodes, old_edges; raise
@@ -428,8 +432,9 @@ def neo4j_statements(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -
     statements = [(query, {}) for query in CONSTRAINTS]
     for node in nodes:
         params = dict(node); params.update(node["provenance"])
-        issue_props = ", n.issueStatus=$issueStatus, n.dueDate=$dueDate" if "issueStatus" in node else ""
-        statements.append(("MERGE (n:DomainNode {id: $id}) ON CREATE SET n.createdAt=$createdAt SET n.type=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.type ELSE $type END, n.title=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.title ELSE $title END, n.approved=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.approved ELSE $approved END, n.approvalStatus=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.approvalStatus ELSE $approvalStatus END, n.extractionMethod=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.extractionMethod ELSE $extractionMethod END, n.confidence=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.confidence ELSE $confidence END, n.evidenceExcerpt=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.evidenceExcerpt ELSE $evidenceExcerpt END, n.sourceId=$source_id, n.sourceType=$source_type, n.sourceLocator=$source_locator, n.sourceAnchor=$source_anchor, n.sourceRevision=$source_revision, n.retrievedAt=$retrieved_at, n.updatedBy=$updated_by, n.observedAt=$observed_at" + issue_props, {**params, "createdAt": node["provenance"].get("retrieved_at"), "issueStatus": node.get("issueStatus"), "dueDate": node.get("dueDate")}))
+        extra_fields = ("issueStatus", "dueDate", "githubNumber", "githubDatabaseId", "githubSha", "githubState", "githubCreatedAt", "githubUpdatedAt", "githubClosedAt", "githubMergedAt", "githubSubmittedAt", "githubCommittedAt", "githubUrl", "headSha", "mergeCommitSha", "reviewState", "commitSha")
+        issue_props = "".join(f", n.{field}=${field}" for field in extra_fields if field in node)
+        statements.append(("MERGE (n:DomainNode {id: $id}) ON CREATE SET n.createdAt=$createdAt SET n.type=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.type ELSE $type END, n.title=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.title ELSE $title END, n.approved=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.approved ELSE $approved END, n.approvalStatus=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.approvalStatus ELSE $approvalStatus END, n.extractionMethod=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.extractionMethod ELSE $extractionMethod END, n.confidence=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.confidence ELSE $confidence END, n.evidenceExcerpt=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.evidenceExcerpt ELSE $evidenceExcerpt END, n.sourceId=$source_id, n.sourceType=$source_type, n.sourceLocator=$source_locator, n.sourceAnchor=$source_anchor, n.sourceRevision=$source_revision, n.retrievedAt=$retrieved_at, n.updatedBy=$updated_by, n.observedAt=$observed_at" + issue_props, {**params, "createdAt": node["provenance"].get("retrieved_at")}))
     for edge in edges:
         payload = dict(edge); payload["key"] = f"{edge['from']}|{edge['type']}|{edge['to']}"; payload.update(edge["provenance"])
         statements.append(("MATCH (a:DomainNode {id:$from}), (b:DomainNode {id:$to}) MERGE (a)-[r:RELATION {key:$key}]->(b) SET r.type=$type, r.approvalStatus=$approvalStatus, r.extractionMethod=$extractionMethod, r.confidence=$confidence, r.evidenceExcerpt=$evidenceExcerpt, r.sourceId=$source_id, r.sourceType=$source_type, r.sourceLocator=$source_locator, r.sourceAnchor=$source_anchor, r.sourceRevision=$source_revision, r.retrievedAt=$retrieved_at, r.updatedBy=$updated_by, r.observedAt=$observed_at", payload))
