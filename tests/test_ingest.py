@@ -1,9 +1,11 @@
 import json
+import hashlib
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
-from domain_graph.ingest import InMemoryGraph, InputValidationError, load_inputs, neo4j_statements, normalize_inputs
+from domain_graph.ingest import InMemoryGraph, InputValidationError, load_inputs, load_issue_tracker, neo4j_statements, normalize_inputs
 from domain_graph.query import trace
 
 
@@ -14,6 +16,58 @@ def graph():
 
 
 class IngestTests(unittest.TestCase):
+  def _tracker(self, directory, raw, fmt="csv", **overrides):
+    export = directory / "SRC-TRACKER-TEST"
+    export.mkdir()
+    filename = "original." + fmt
+    (export / filename).write_bytes(raw)
+    mapping = {"issueId": "id", "title": "title", "status": "status", "dueDate": "due", "assigneeId": "owner", "requirementIds": "requirements"}
+    manifest = {"schemaVersion": "1.0", "exportId": export.name, "originalFile": filename, "format": fmt,
+                "encoding": "utf-8", "sourceRevision": "sha256:" + hashlib.sha256(raw).hexdigest(),
+                "retrievedAt": "2026-09-12T00:00:00Z", "observedAt": "2026-09-12T00:00:00Z",
+                "updatedBy": "fixture-exporter", "approvalStatus": "approved", "statusMap": {"open": "open", "done": "done"},
+                "requirementIdSeparator": ";"}
+    manifest["columnMap" if fmt == "csv" else "recordMap"] = mapping
+    if fmt == "json": manifest["recordsPath"] = "$.issues"
+    manifest.update(overrides)
+    (export / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return export
+
+  def test_issue_tracker_csv_preserves_source_and_normalizes_relations(self):
+    raw = "id,title,status,due,owner,requirements\nISSUE-TEST-001,確認する,open,2026-10-01,TEAM-TEST,REQ-ORDER-001\n".encode()
+    with tempfile.TemporaryDirectory() as directory:
+      export = self._tracker(Path(directory), raw)
+      before = (hashlib.sha256((export / "original.csv").read_bytes()).hexdigest(), os.stat(export / "original.csv").st_mtime_ns)
+      records = load_issue_tracker(export)
+      issue = next(r for r in records if r["type"] == "Issue")
+      self.assertEqual(issue["issueStatus"], "open")
+      self.assertEqual(issue["dueDate"], "2026-10-01")
+      self.assertEqual({(r["type"], r["to"]) for r in issue["relations"]}, {("DERIVED_FROM", export.name), ("RELATES_TO", "TEAM-TEST"), ("RELATES_TO", "REQ-ORDER-001")})
+      self.assertEqual(before, (hashlib.sha256((export / "original.csv").read_bytes()).hexdigest(), os.stat(export / "original.csv").st_mtime_ns))
+
+  def test_issue_tracker_json_and_safe_errors(self):
+    raw = json.dumps({"issues": [{"key": "ISSUE-TEST-001", "summary": "確認する", "state": "done", "due": "", "owner": "", "req": ""}]}).encode()
+    with tempfile.TemporaryDirectory() as directory:
+      export = self._tracker(Path(directory), raw, "json")
+      manifest = json.loads((export / "manifest.json").read_text())
+      manifest["recordMap"]["issueId"] = "missing"
+      (export / "manifest.json").write_text(json.dumps(manifest))
+      with self.assertRaises(InputValidationError) as caught: load_issue_tracker(export)
+      self.assertEqual(caught.exception.as_dict()["code"], "missing_required_value")
+      self.assertNotIn("確認する", str(caught.exception))
+
+  def test_issue_tracker_rejects_duplicate_and_pii(self):
+    raw = b"id,title,status,due,owner,requirements\nISSUE-TEST-001,One,open,,,\nISSUE-TEST-001,Two,open,,,\n"
+    with tempfile.TemporaryDirectory() as directory:
+      export = self._tracker(Path(directory), raw)
+      with self.assertRaises(InputValidationError) as caught: load_issue_tracker(export)
+      self.assertEqual(caught.exception.as_dict()["code"], "duplicate_record_id")
+      raw = b"id,title,status,due,owner,requirements\nISSUE-TEST-001,One,open,,person@example.invalid,\n"
+      (export / "original.csv").write_bytes(raw)
+      manifest = json.loads((export / "manifest.json").read_text()); manifest["sourceRevision"] = "sha256:" + hashlib.sha256(raw).hexdigest()
+      (export / "manifest.json").write_text(json.dumps(manifest))
+      with self.assertRaises(InputValidationError) as caught: load_issue_tracker(export)
+      self.assertEqual(caught.exception.as_dict()["code"], "pii_or_unsafe_assignee")
   def test_trace_has_provenance_and_expected_ids(self):
     result = trace(graph(), "REQ-ORDER-001", "CODE-ORDER-001")
     ids = {n["id"] for n in result["nodes"]}

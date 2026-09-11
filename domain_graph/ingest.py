@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import ast
+import csv
+import hashlib
+import io
 import json
 import re
 from urllib.parse import urlparse
@@ -19,6 +22,7 @@ ID_PATTERN = re.compile(r"^[A-Z0-9]+(?:-[A-Z0-9]+)+$")
 UTC_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
 SENSITIVE_PATTERN = re.compile(r"(?i)(?:password|passwd|token|secret|api[_ -]?key|cookie|private[_ -]?key)\s*[:=]")
 EMAIL_PATTERN = re.compile(r"\b[^\s@]+@[^\s@]+\.[^\s@]+\b")
+ISSUE_DATE_PATTERN = re.compile(r"^(?:\d{4}-\d{2}-\d{2}|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$")
 
 
 class InputValidationError(ValueError):
@@ -187,11 +191,193 @@ def load_inputs(root: str | Path) -> list[dict[str, Any]]:
     return records
 
 
+def _strict_json(data: bytes, path: Path) -> Any:
+    """Decode a UTF-8 JSON document without silently accepting duplicate keys."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _error("unsupported_encoding", path, "encoding", "input must be UTF-8") from exc
+    if "\x00" in text:
+        raise _error("invalid_json", path, "$", "NUL is not allowed")
+    def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in items:
+            if key in result:
+                raise _error("invalid_json", path, "$", "duplicate JSON key")
+            result[key] = value
+        return result
+    try:
+        return json.loads(text, object_pairs_hook=pairs)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise _error("invalid_json", path, "$", "invalid JSON") from exc
+
+
+def _manifest_error(path: Path, field: str, message: str) -> InputValidationError:
+    return _error("invalid_manifest", path, field, message)
+
+
+def _safe_manifest(manifest: Any, path: Path, export_id: str) -> dict[str, Any]:
+    if not isinstance(manifest, dict) or manifest.get("schemaVersion") != "1.0":
+        raise _manifest_error(path, "schemaVersion", "manifest schemaVersion must be 1.0")
+    required = ("exportId", "originalFile", "format", "encoding", "sourceRevision",
+                "retrievedAt", "observedAt", "updatedBy", "approvalStatus")
+    missing = next((key for key in required if key not in manifest), None)
+    if missing:
+        raise _manifest_error(path, missing, "required manifest field")
+    if manifest["exportId"] != export_id or not isinstance(export_id, str) or not ID_PATTERN.fullmatch(export_id):
+        raise _manifest_error(path, "exportId", "exportId must match the export directory")
+    if manifest["format"] not in {"csv", "json"}:
+        raise _manifest_error(path, "format", "format must be csv or json")
+    if manifest["encoding"] != "utf-8":
+        raise _error("unsupported_encoding", path, "encoding", "only UTF-8 is supported")
+    if not isinstance(manifest["sourceRevision"], str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", manifest["sourceRevision"]):
+        raise _manifest_error(path, "sourceRevision", "sourceRevision must be a sha256 digest")
+    for field in ("retrievedAt", "observedAt"):
+        _valid_datetime(manifest[field], path, field)
+    if manifest["approvalStatus"] not in {"approved", "proposed"}:
+        raise _manifest_error(path, "approvalStatus", "approvalStatus must be approved or proposed")
+    filename = manifest["originalFile"]
+    if not isinstance(filename, str) or not filename or Path(filename).name != filename or filename.startswith("."):
+        raise _manifest_error(path, "originalFile", "originalFile must be a safe basename")
+    if manifest["format"] == "csv":
+        cmap = manifest.get("columnMap")
+        if not isinstance(cmap, dict) or set(cmap) != {"issueId", "title", "status", "dueDate", "assigneeId", "requirementIds"}:
+            raise _manifest_error(path, "columnMap", "explicit mapping for all issue fields is required")
+        if not all(isinstance(v, str) and v for v in cmap.values()) or len(set(cmap.values())) != len(cmap):
+            raise _manifest_error(path, "columnMap", "column headers must be distinct strings")
+    else:
+        rmap = manifest.get("recordMap")
+        if not isinstance(rmap, dict) or set(rmap) != {"issueId", "title", "status", "dueDate", "assigneeId", "requirementIds"}:
+            raise _manifest_error(path, "recordMap", "explicit mapping for all issue fields is required")
+        if not all(isinstance(v, str) and v for v in rmap.values()) or len(set(rmap.values())) != len(rmap):
+            raise _manifest_error(path, "recordMap", "JSON keys must be distinct strings")
+        records_path = manifest.get("recordsPath")
+        if records_path is not None and (not isinstance(records_path, str) or not re.fullmatch(r"\$\.[A-Za-z_][A-Za-z0-9_]*", records_path)):
+            raise _manifest_error(path, "recordsPath", "recordsPath must be a simple JSON path")
+    if not isinstance(manifest.get("statusMap"), dict) or not manifest["statusMap"]:
+        raise _manifest_error(path, "statusMap", "statusMap is required")
+    if any(v not in {"open", "in_progress", "blocked", "done", "cancelled"} for v in manifest["statusMap"].values()):
+        raise _manifest_error(path, "statusMap", "unsupported normalized status")
+    if not isinstance(manifest.get("requirementIdSeparator", ";"), str) or not manifest.get("requirementIdSeparator", ";"):
+        raise _manifest_error(path, "requirementIdSeparator", "separator must be non-empty")
+    return manifest
+
+
+def load_issue_tracker(export_dir: str | Path) -> list[dict[str, Any]]:
+    """Load one approved, local issue-tracker export using its manifest."""
+    directory = Path(export_dir)
+    manifest_path = directory / "manifest.json"
+    try:
+        manifest = _strict_json(manifest_path.read_bytes(), manifest_path)
+    except FileNotFoundError as exc:
+        raise _error("invalid_manifest", manifest_path, "$", "manifest.json is required") from exc
+    export_id = directory.name
+    manifest = _safe_manifest(manifest, manifest_path, export_id)
+    original = directory / manifest["originalFile"]
+    try:
+        raw = original.read_bytes()
+    except OSError as exc:
+        raise _error("invalid_manifest", manifest_path, "originalFile", "original file is not readable") from exc
+    digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+    if digest != manifest["sourceRevision"]:
+        raise _manifest_error(manifest_path, "sourceRevision", "sourceRevision does not match original file")
+    if b"\x00" in raw:
+        raise _error("invalid_csv" if manifest["format"] == "csv" else "invalid_json", original, "$", "NUL is not allowed")
+    if manifest["format"] == "csv":
+        # A BOM is allowed once at the beginning only; strict decoding rejects UTF-16.
+        if raw.startswith(b"\xef\xbb\xbf"): raw = raw[3:]
+        try: text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc: raise _error("unsupported_encoding", original, "encoding", "input must be UTF-8") from exc
+        if "\r\n" in text and "\n" in text.replace("\r\n", "") or "\r" in text.replace("\r\n", ""):
+            raise _error("invalid_csv", original, "$", "mixed line endings are not allowed")
+        try:
+            rows = list(csv.DictReader(io.StringIO(text, newline=""), delimiter=manifest.get("delimiter", ","), strict=True))
+        except (csv.Error, TypeError) as exc:
+            raise _error("invalid_csv", original, "$", "invalid CSV") from exc
+        if not rows or rows[0] is None:
+            raise _error("missing_column", original, "header", "CSV header is required")
+        expected = set(manifest["columnMap"].values())
+        if set(rows[0].keys()) != expected:
+            raise _error("missing_column", original, "header", "CSV header does not match manifest")
+        raw_records = [(row, f"row:{i + 2}") for i, row in enumerate(rows)]
+    else:
+        value = _strict_json(raw, original)
+        records_path = manifest.get("recordsPath")
+        if records_path:
+            value = value.get(records_path[2:]) if isinstance(value, dict) else None
+        if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+            raise _error("invalid_json", original, "recordsPath", "records must be an array of objects")
+        raw_records = [(item, f"/{i}") for i, item in enumerate(value)]
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    cmap = manifest.get("columnMap", manifest.get("recordMap"))
+    for item, anchor in raw_records:
+        def get(field: str) -> Any: return item.get(cmap[field])
+        rid, title, status_raw = get("issueId"), get("title"), get("status")
+        if not isinstance(rid, str) or not rid.strip() or not ID_PATTERN.fullmatch(rid.strip()):
+            raise _error("missing_required_value", original, "issueId", "issueId is required")
+        rid = rid.strip()
+        if rid in seen: raise _error("duplicate_record_id", original, "issueId", "duplicate issueId", rid)
+        seen.add(rid)
+        if not isinstance(title, str) or not title.strip(): raise _error("missing_required_value", original, "title", "title is required", rid)
+        title = title.strip(); _safe_excerpt(title, original, "title", rid)
+        if not isinstance(status_raw, str) or status_raw not in manifest["statusMap"]:
+            raise _error("invalid_status", original, "status", "status is not in statusMap", rid)
+        due = get("dueDate")
+        if due is None: due = ""
+        if not isinstance(due, str): raise _error("invalid_date", original, "dueDate", "invalid due date", rid)
+        due = due.strip()
+        if due:
+            if not ISSUE_DATE_PATTERN.fullmatch(due): raise _error("invalid_date", original, "dueDate", "invalid due date", rid)
+            try: datetime.fromisoformat(due.replace("Z", "+00:00"))
+            except ValueError as exc: raise _error("invalid_date", original, "dueDate", "invalid due date", rid) from exc
+        assignee = get("assigneeId") or ""
+        if not isinstance(assignee, str): raise _error("pii_or_unsafe_assignee", original, "assigneeId", "assignee must be an opaque identifier", rid)
+        assignee = assignee.strip()
+        if assignee and (not ID_PATTERN.fullmatch(assignee) or EMAIL_PATTERN.search(assignee)):
+            raise _error("pii_or_unsafe_assignee", original, "assigneeId", "assignee must be an opaque identifier", rid)
+        reqs = get("requirementIds") or ""
+        if not isinstance(reqs, str): raise _error("unknown_target", original, "requirementIds", "requirement IDs must be text", rid)
+        req_ids = [v.strip() for v in reqs.split(manifest.get("requirementIdSeparator", ";")) if v.strip()]
+        if len(req_ids) != len(set(req_ids)) or any(not ID_PATTERN.fullmatch(v) for v in req_ids):
+            raise _error("unknown_target", original, "requirementIds", "invalid or duplicate requirement ID", rid)
+        provenance = {"source_id": f"{export_id}:{rid}", "source_type": "issue-trackers",
+                      "source_locator": f"inputs/issue-trackers/{export_id}/{original.name}", "source_anchor": anchor,
+                      "source_revision": manifest["sourceRevision"], "retrieved_at": manifest["retrievedAt"],
+                      "updated_by": manifest["updatedBy"], "observed_at": manifest["observedAt"],
+                      "extraction_method": "deterministic_import", "confidence": 1.0,
+                      "evidence_excerpt": title}
+        relations = [{"type": "DERIVED_FROM", "to": export_id, "evidenceExcerpt": "課題管理表エクスポート由来", "provenance": {**provenance, "source_anchor": f"{anchor}:source"}}]
+        if assignee: relations.append({"type": "RELATES_TO", "to": assignee, "evidenceExcerpt": "担当IDの明示参照", "provenance": {**provenance, "source_anchor": f"{anchor}:assignee"}})
+        for req in req_ids: relations.append({"type": "RELATES_TO", "to": req, "evidenceExcerpt": "関連要件IDの明示参照", "provenance": {**provenance, "source_anchor": f"{anchor}:requirementIds"}})
+        result.append({"id": rid, "title": title, "type": "Issue", "approvalStatus": manifest["approvalStatus"], "extractionMethod": "deterministic_import", "confidence": 1.0, "evidenceExcerpt": title, "provenance": provenance, "issueStatus": manifest["statusMap"][status_raw], "dueDate": due or None, "relations": relations})
+    result.append({"id": export_id, "title": "課題管理表エクスポート", "type": "SourceDocument", "approvalStatus": manifest["approvalStatus"], "extractionMethod": "deterministic_import", "confidence": 1.0, "evidenceExcerpt": "課題管理表エクスポート", "provenance": {"source_id": export_id, "source_type": "issue-trackers", "source_locator": f"inputs/issue-trackers/{export_id}/{original.name}", "source_anchor": "$", "source_revision": manifest["sourceRevision"], "retrieved_at": manifest["retrievedAt"], "updated_by": manifest["updatedBy"], "observed_at": manifest["observedAt"], "extraction_method": "deterministic_import", "confidence": 1.0, "evidence_excerpt": "課題管理表エクスポート"}, "relations": []})
+    return result
+
+
+def load_issue_trackers(root: str | Path) -> list[dict[str, Any]]:
+    root = Path(root); records: list[dict[str, Any]] = []
+    for directory in sorted(root.iterdir()):
+        if directory.is_dir() and not directory.name.startswith("_"):
+            records.extend(load_issue_tracker(directory))
+    if not records: raise InputValidationError("no issue tracker exports", code="no_inputs", path=root)
+    return records
+
+
+# Descriptive aliases kept small so callers need not depend on the internal
+# directory terminology used by the design document.
+load_issue_tracker_export = load_issue_tracker
+load_issue_tracker_inputs = load_issue_trackers
+
+
 def normalize_inputs(records: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     nodes: dict[str, dict[str, Any]] = {}; edges: dict[tuple[str, str, str], dict[str, Any]] = {}
     for record in records:
         rid = record["id"]; status = record.get("approvalStatus", "approved" if record.get("approved", False) else "proposed"); method = record.get("extractionMethod", "deterministic_import"); confidence = float(record.get("confidence", 1.0)); evidence = record.get("evidenceExcerpt", record["title"])
         node = {"id": rid, "type": record["type"], "title": record["title"], "approved": status == "approved", "approvalStatus": status, "extractionMethod": method, "confidence": confidence, "evidenceExcerpt": evidence, "provenance": record.get("provenance") or {}}
+        if record.get("type") == "Issue":
+            node["issueStatus"] = record.get("issueStatus")
+            node["dueDate"] = record.get("dueDate")
         if rid in nodes and nodes[rid] != node: raise InputValidationError("conflicting record", code="conflicting_record", record_id=rid)
         nodes[rid] = node
         for relation in record.get("relations", []):
@@ -211,7 +397,9 @@ class InMemoryGraph:
                 existing = self.nodes.get(node["id"])
                 if existing and existing != node:
                     # Never let an unapproved/AI assertion replace a human-approved definition.
-                    if existing.get("approvalStatus") == "approved" and existing.get("extractionMethod") != "ai_inferred":
+                    # Issue exports additionally reject every cross-export difference;
+                    # there is no assertion store in the Phase 1 relation model.
+                    if node.get("type") == "Issue" or existing.get("approvalStatus") == "approved" and existing.get("extractionMethod") != "ai_inferred":
                         raise InputValidationError("conflicting record", code="conflicting_record", record_id=node["id"])
                     self.nodes[node["id"]] = node
                 else:
@@ -219,7 +407,7 @@ class InMemoryGraph:
             for edge in edges:
                 if edge["to"] not in self.nodes: raise InputValidationError(f"unregistered target: {edge['to']}", code="unknown_target")
                 key = (edge["from"], edge["type"], edge["to"]); existing = self.edges.get(key)
-                if existing and existing != edge and existing.get("approvalStatus") == "approved" and existing.get("extractionMethod") != "ai_inferred":
+                if existing and existing != edge and (edge.get("from") in self.nodes and self.nodes[edge["from"]].get("type") == "Issue" or existing.get("approvalStatus") == "approved" and existing.get("extractionMethod") != "ai_inferred"):
                     raise InputValidationError("conflicting relation", code="conflicting_record", record_id=edge["from"])
                 self.edges[key] = edge
         except Exception: self.nodes, self.edges = old_nodes, old_edges; raise
@@ -240,7 +428,8 @@ def neo4j_statements(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -
     statements = [(query, {}) for query in CONSTRAINTS]
     for node in nodes:
         params = dict(node); params.update(node["provenance"])
-        statements.append(("MERGE (n:DomainNode {id: $id}) ON CREATE SET n.createdAt=$createdAt SET n.type=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.type ELSE $type END, n.title=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.title ELSE $title END, n.approved=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.approved ELSE $approved END, n.approvalStatus=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.approvalStatus ELSE $approvalStatus END, n.extractionMethod=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.extractionMethod ELSE $extractionMethod END, n.confidence=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.confidence ELSE $confidence END, n.evidenceExcerpt=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.evidenceExcerpt ELSE $evidenceExcerpt END, n.sourceId=$source_id, n.sourceType=$source_type, n.sourceLocator=$source_locator, n.sourceAnchor=$source_anchor, n.sourceRevision=$source_revision, n.retrievedAt=$retrieved_at, n.updatedBy=$updated_by, n.observedAt=$observed_at", {**params, "createdAt": node["provenance"].get("retrieved_at")}))
+        issue_props = ", n.issueStatus=$issueStatus, n.dueDate=$dueDate" if "issueStatus" in node else ""
+        statements.append(("MERGE (n:DomainNode {id: $id}) ON CREATE SET n.createdAt=$createdAt SET n.type=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.type ELSE $type END, n.title=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.title ELSE $title END, n.approved=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.approved ELSE $approved END, n.approvalStatus=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.approvalStatus ELSE $approvalStatus END, n.extractionMethod=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.extractionMethod ELSE $extractionMethod END, n.confidence=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.confidence ELSE $confidence END, n.evidenceExcerpt=CASE WHEN n.approvalStatus='approved' AND n.extractionMethod <> 'ai_inferred' AND $approvalStatus <> 'approved' THEN n.evidenceExcerpt ELSE $evidenceExcerpt END, n.sourceId=$source_id, n.sourceType=$source_type, n.sourceLocator=$source_locator, n.sourceAnchor=$source_anchor, n.sourceRevision=$source_revision, n.retrievedAt=$retrieved_at, n.updatedBy=$updated_by, n.observedAt=$observed_at" + issue_props, {**params, "createdAt": node["provenance"].get("retrieved_at"), "issueStatus": node.get("issueStatus"), "dueDate": node.get("dueDate")}))
     for edge in edges:
         payload = dict(edge); payload["key"] = f"{edge['from']}|{edge['type']}|{edge['to']}"; payload.update(edge["provenance"])
         statements.append(("MATCH (a:DomainNode {id:$from}), (b:DomainNode {id:$to}) MERGE (a)-[r:RELATION {key:$key}]->(b) SET r.type=$type, r.approvalStatus=$approvalStatus, r.extractionMethod=$extractionMethod, r.confidence=$confidence, r.evidenceExcerpt=$evidenceExcerpt, r.sourceId=$source_id, r.sourceType=$source_type, r.sourceLocator=$source_locator, r.sourceAnchor=$source_anchor, r.sourceRevision=$source_revision, r.retrievedAt=$retrieved_at, r.updatedBy=$updated_by, r.observedAt=$observed_at", payload))
