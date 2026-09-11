@@ -110,3 +110,32 @@ Neo4jStore(driver).ingest(load_inputs("inputs"))
 ```
 
 サンプル入力では `REQ-ORDER-001` から `DEC-ORDER-001`、`MTG-2026-001`、`DSN-ORDER-001`、`CODE-ORDER-001` を provenance 付きで辿れます。問い合わせ対象が未登録の場合は `not_registered`、登録済みでも指定先への根拠がない場合は `evidence_insufficient` を返します。`python3 -m unittest discover -v` で主要な受け入れ条件を検証できます。
+
+## Node.js 開発基盤と Neo4j ローカル環境
+
+Node.js 22（`.nvmrc`）、TypeScript、Vitest、ESLint を使用します。Node 側の実装は
+Neo4j 接続設定と疎通確認の境界を提供し、既存の Python MVP（`domain_graph/`）の
+取り込み契約を置き換えません。
+
+初回セットアップ:
+
+```sh
+cp .env.example .env
+# .env の NEO4J_PASSWORD をローカル専用の値へ変更する
+npm install
+docker compose up -d --wait
+npm run test:neo4j
+npm test
+npm run lint
+npm run build
+```
+
+`NEO4J_URI`、`NEO4J_USERNAME`、`NEO4J_PASSWORD` は必須です。`.env` は Git の追跡対象外で、
+パスワードはログやグラフ属性へ出力しません。Neo4j は Bolt `7687`、Browser `7474` を公開し、
+`neo4j_data` と `neo4j_logs` の名前付き volume に保存します。停止する場合は次を実行します。
+
+```sh
+NEO4J_PASSWORD=<.env と同じ値> docker compose down
+```
+
+データも削除して初期化する場合のみ、同じく `NEO4J_PASSWORD=... docker compose down -v` を実行してください。
